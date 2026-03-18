@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         ShortLink Master (SLM)
-// @version      4.4
-// @description  Framework profesional para bypass de shortlinks + Control total de document
+// @name         ShortLink Master (SLM) + Document Controller
+// @version      4.6
+// @description  Professional framework for shortlink bypassing + full document control
 // @match        *://*/*
 // @grant        none
 // @run-at       document-start
@@ -13,10 +13,10 @@
     if (window.self !== window.top) return;
 
     // =========================================================================
-    // 0. CONFIGURACIÓN
+    // 0. CONFIG
     // =========================================================================
     const Config = {
-        settings: { waitInterval: 250, fastMode: false, debug: false, cacheEnabled: true },
+        settings: { waitInterval: 250, fastMode: false, cacheEnabled: true },
 
         async detectOptimalSettings() {
             const isMobile = /Mobi|Android/i.test(navigator.userAgent);
@@ -33,57 +33,104 @@
     // =========================================================================
     // 1. CACHE
     // =========================================================================
-    const Cache = {
-        _map: new Map(),
-        TTL: { selector: 300_000, xpath: 120_000 },
+    const Cache = (() => {
+        const _map = new Map();
+        const TTL  = { selector: 300_000, xpath: 120_000 };
 
-        _isLive(value) {
-            if (value instanceof Node) return value.isConnected;
-            if (Array.isArray(value)) return value.length > 0 && value[0] instanceof Node
-                ? value.every(n => n.isConnected)
-                : true;
+        const _isLive = v => {
+            if (v instanceof Node) return v.isConnected;
+            if (Array.isArray(v))  return !v.length || !(v[0] instanceof Node) || v.every(n => n.isConnected);
             return true;
-        },
+        };
 
-        get(key, ttl) {
-            if (!Config.settings.cacheEnabled) return null;
-            const entry = this._map.get(key);
-            if (!entry || Date.now() - entry.ts >= ttl) return null;
-            if (!this._isLive(entry.v)) { this._map.delete(key); return null; }
-            return entry.v;
-        },
-
-        set(key, value) {
-            if (Config.settings.cacheEnabled)
-                this._map.set(key, { v: value, ts: Date.now() });
-        },
-
-        cleanup() {
-            const now = Date.now();
-            for (const [k, e] of this._map)
-                if (now - e.ts > this.TTL.selector || !this._isLive(e.v))
-                    this._map.delete(k);
-        },
-
-        clear() { this._map.clear(); }
-    };
+        return {
+            TTL,
+            get(key, ttl) {
+                if (!Config.settings.cacheEnabled) return null;
+                const e = _map.get(key);
+                if (!e || Date.now() - e.ts >= ttl) return null;
+                if (!_isLive(e.v)) { _map.delete(key); return null; }
+                return e.v;
+            },
+            set(key, value) {
+                if (Config.settings.cacheEnabled) _map.set(key, { v: value, ts: Date.now() });
+            },
+            cleanup() {
+                const now = Date.now();
+                for (const [k, e] of _map)
+                    if (now - e.ts > TTL.selector || !_isLive(e.v)) _map.delete(k);
+            },
+            clear() { _map.clear(); }
+        };
+    })();
 
     setInterval(() => Cache.cleanup(), 300_000);
 
-    let _lastUrl = location.href;
-    new MutationObserver(() => {
-        if (location.href !== _lastUrl) { _lastUrl = location.href; Cache.clear(); }
-    }).observe(document, { subtree: true, childList: true });
+    // =========================================================================
+    // 2. SPA MANAGER
+    // =========================================================================
+    const SPAManager = (() => {
+        let _lastPath   = location.pathname;
+        let _cleanups   = [];   
+        let _debounceId = null; 
+
+        const _onChange = () => {
+            const newPath = location.pathname;
+            if (newPath === _lastPath) return;
+
+            console.log(`[SLM] SPA: ${_lastPath} → ${newPath}`);
+            _lastPath = newPath;
+
+            Cache.clear();
+
+            for (const fn of _cleanups) {
+                try { fn(); } catch (e) { console.warn('[SLM] SPA cleanup error:', e); }
+            }
+            _cleanups = [];
+
+            setTimeout(() => Router.run(), 100);
+        };
+
+        const _trigger = () => {
+            clearTimeout(_debounceId);
+            _debounceId = setTimeout(_onChange, 50);
+        };
+
+        return {
+            onLeave(fn) { _cleanups.push(fn); },
+
+            init() {
+                for (const method of ['pushState', 'replaceState']) {
+                    const orig = history[method];
+                    history[method] = function (...args) {
+                        orig.apply(this, args);
+                        _trigger();
+                    };
+                }
+
+                window.addEventListener('popstate', _trigger);
+
+                let _lastUrl = location.href;
+                new MutationObserver(() => {
+                    if (location.href !== _lastUrl) {
+                        _lastUrl = location.href;
+                        Cache.clear();
+                        _trigger();
+                    }
+                }).observe(document, { subtree: true, childList: true });
+            }
+        };
+    })();
 
     // =========================================================================
-    // 2. WAITERS
+    // 3. WAITERS
     // =========================================================================
     const Waiters = {
         sleep: ms => new Promise(r => setTimeout(r, ms)),
 
         async waitForElement(selector, timeout = 30, checkVisible = false) {
             const deadline  = Date.now() + timeout * 1000;
-            const isComplex = selector.includes('XPATH') || selector.includes('contains') || selector.includes('text()');
+            const isComplex = /XPATH|contains|text\(\)/.test(selector);
             let interval = isComplex ? 200 : Config.settings.waitInterval;
             let attempts = 0;
 
@@ -91,8 +138,8 @@
                 const el = Browser.getElement(selector, false);
                 if (el) {
                     if (!checkVisible) return el;
-                    const r = el.getBoundingClientRect();
-                    if (r.width > 0 && r.height > 0) return el;
+                    const { width, height } = el.getBoundingClientRect();
+                    if (width > 0 && height > 0) return el;
                 }
                 if (++attempts > 5) interval = Math.min(interval * 1.3, 500);
                 await this.sleep(interval);
@@ -100,27 +147,15 @@
             return null;
         },
 
-        // Espera a que cualquiera de los selectores sea visible
         async waitForAnyVisible(selectorList, timeout = 30) {
-            const selectors = selectorList.split(',').map(s => s.trim());
-            const deadline  = Date.now() + timeout * 1000;
-            let interval = 100, attempts = 0;
-
-            while (Date.now() < deadline) {
-                for (const sel of selectors) {
-                    const el = Browser.getElement(sel, false);
-                    if (el) {
-                        const r = el.getBoundingClientRect();
-                        if (r.width > 0 && r.height > 0) return el;
-                    }
-                }
-                if (++attempts > 5) interval = Math.min(interval * 1.3, 400);
-                await this.sleep(interval);
-            }
-            return null;
+            return this._waitForAny(selectorList, timeout, true);
         },
 
         async waitForAny(selectorList, timeout = 30) {
+            return this._waitForAny(selectorList, timeout, false);
+        },
+
+        async _waitForAny(selectorList, timeout, checkVisible) {
             const selectors = selectorList.split(',').map(s => s.trim());
             const deadline  = Date.now() + timeout * 1000;
             let interval = 100, attempts = 0;
@@ -128,7 +163,10 @@
             while (Date.now() < deadline) {
                 for (const sel of selectors) {
                     const el = Browser.getElement(sel, false);
-                    if (el) return el;
+                    if (!el) continue;
+                    if (!checkVisible) return el;
+                    const { width, height } = el.getBoundingClientRect();
+                    if (width > 0 && height > 0) return el;
                 }
                 if (++attempts > 5) interval = Math.min(interval * 1.3, 400);
                 await this.sleep(interval);
@@ -141,8 +179,8 @@
             while (Date.now() < deadline) {
                 const el = Browser.getElement(selector, false);
                 if (!el) return true;
-                const r = el.getBoundingClientRect();
-                if (r.width === 0 || r.height === 0) return true;
+                const { width, height } = el.getBoundingClientRect();
+                if (width === 0 || height === 0) return true;
                 await this.sleep(200);
             }
             return false;
@@ -165,7 +203,7 @@
     };
 
     // =========================================================================
-    // 3. BROWSER
+    // 4. BROWSER
     // =========================================================================
     const TOKEN_RE = />(CSS|MATCH|XPATH|AT|FRAME|SHADOW)>/g;
 
@@ -220,9 +258,7 @@
                                 (_, k) => snap.snapshotItem(k));
                         }
 
-                        case 'at':
-                            return Array.isArray(ctx) ? ctx[parseInt(cmd.value, 10) || 0] : ctx;
-
+                        case 'at':     return Array.isArray(ctx) ? ctx[parseInt(cmd.value, 10) || 0] : ctx;
                         case 'shadow': return ctx.shadowRoot || ctx;
                         case 'frame':  return ctx.contentDocument || ctx.contentWindow?.document || ctx;
 
@@ -245,8 +281,8 @@
             const el = this.getElement(selector, false);
             if (!el) return false;
             if (!checkVisible) return true;
-            const r = el.getBoundingClientRect();
-            return r.width > 0 && r.height > 0;
+            const { width, height } = el.getBoundingClientRect();
+            return width > 0 && height > 0;
         },
 
         async click(selector, timeout = 30) {
@@ -264,8 +300,8 @@
                         bubbles: true, cancelable: true, view: window,
                         clientX: left + width / 2, clientY: top + height / 2, buttons: 1
                     };
-                    ['mousedown', 'mouseup', 'click'].forEach(e =>
-                        el.dispatchEvent(new MouseEvent(e, opts)));
+                    for (const e of ['mousedown', 'mouseup', 'click'])
+                        el.dispatchEvent(new MouseEvent(e, opts));
                     return true;
                 } catch { return false; }
             }
@@ -279,37 +315,56 @@
                 : el.innerText?.trim() || el.textContent?.trim() || '';
         },
 
-        // Redirigir a una URL de forma centralizada y segura
         redirect(url) {
-            if (!url || typeof url !== 'string') {
-                console.warn('[SLM] redirect: URL inválida:', url);
-                return false;
-            }
+            if (!url || typeof url !== 'string') return false;
             try {
                 const parsed = new URL(url, location.href);
-                if (!['http:', 'https:'].includes(parsed.protocol)) {
-                    console.warn('[SLM] redirect: protocolo no permitido:', parsed.protocol);
-                    return false;
-                }
+                if (!['http:', 'https:'].includes(parsed.protocol)) return false;
                 window.location.assign(parsed.href);
                 return true;
-            } catch {
-                console.warn('[SLM] redirect: URL malformada:', url);
-                return false;
-            }
+            } catch { return false; }
         },
 
         popupsToRedirects() {
-            window.open = (url) => {
-                if (url) this.redirect(url);
-                return window;
-            };
-            console.log('[SLM] window.open → redirige en lugar de abrir popup');
-        }
+            window.open = url => { if (url) this.redirect(url); return window; };
+            console.log('[SLM] window.open → redirects instead of popup');
+        },
+
+        _origOpen: window.open,
+
+        blockPopups() {
+            // No sobreescribir si ya está bloqueado
+            if (window.open === this._fakeOpen) return;
+            console.log('[SLM] window.open → blocked (fake window)');
+            window.open = this._fakeOpen;
+        },
+
+        restorePopups() {
+            window.open = this._origOpen;
+            console.log('[SLM] window.open → restored');
+        },
+
+        _fakeOpen: () => new Proxy(
+            {
+                closed:   false,
+                opener:   null,
+                name:     '',
+                location: { href: 'about:blank', replace: () => {} },
+                close:    () => {},
+                focus:    () => {},
+                blur:     () => {},
+                print:    () => {},
+                postMessage: () => {}
+            },
+            {
+                get: (t, p) => (p in t ? t[p] : undefined),
+                set: (t, p, v) => { t[p] = v; return true; }
+            }
+        )
     };
 
     // =========================================================================
-    // 4. STRING UTILS
+    // 5. STRING UTILS
     // =========================================================================
     const StringUtils = {
         toNumber(str, dec = -1, dS = '.', tS = '') {
@@ -352,26 +407,18 @@
 
         extractUrl(str) {
             if (!str) return null;
-            try {
-                const decoded = decodeURIComponent(str);
-                if (/^https?:\/\//.test(decoded)) return decoded;
-            } catch {}
-            try {
-                const b64 = atob(str);
-                if (/^https?:\/\//.test(b64)) return b64;
-            } catch {}
-            if (/^https?:\/\//.test(str)) return str;
-            return null;
+            try { const d = decodeURIComponent(str); if (/^https?:\/\//.test(d)) return d; } catch {}
+            try { const b = atob(str);               if (/^https?:\/\//.test(b)) return b; } catch {}
+            return /^https?:\/\//.test(str) ? str : null;
         }
     };
 
     // =========================================================================
-    // 5. CAPTCHA
+    // 6. CAPTCHA
     // =========================================================================
     const Captcha = (() => {
-        const safeGetResponse = captchaObj => {
-            try { return !!(captchaObj?.getResponse?.()); }
-            catch { return false; }
+        const safeGetResponse = obj => {
+            try { return !!(obj?.getResponse?.()); } catch { return false; }
         };
 
         const PRESENT_SELECTORS = [
@@ -383,6 +430,7 @@
             '>CSS> input[name="cf-turnstile-response"]'
         ];
 
+        // [value!=""] requiere XPath — no es CSS estándar
         const _resolved = () => {
             try {
                 return (
@@ -410,11 +458,9 @@
                         if (_resolved()) { clearInterval(id); callback(); return; }
                         if (++attempts >= maxAttempts) {
                             clearInterval(id);
-                            console.warn('[SLM] Captcha: máximo de intentos alcanzado');
+                            console.warn('[SLM] Captcha: max attempts reached');
                         }
-                    } catch (e) {
-                        console.error('[SLM] Captcha check error:', e.message);
-                    }
+                    } catch (e) { console.error('[SLM] Captcha check error:', e.message); }
                 }, checkInterval);
                 return id;
             },
@@ -425,34 +471,29 @@
                     let id;
                     const tid = setTimeout(() => {
                         clearInterval(id);
-                        reject(new Error(`[SLM] Captcha timeout después de ${safeTimeout}s`));
+                        reject(new Error(`[SLM] Captcha timeout after ${safeTimeout}s`));
                     }, safeTimeout * 1000);
 
                     id = setInterval(() => {
                         try {
-                            if (_resolved()) {
-                                clearInterval(id); clearTimeout(tid); resolve();
-                            }
-                        } catch (e) {
-                            clearInterval(id); clearTimeout(tid); reject(e);
-                        }
+                            if (_resolved()) { clearInterval(id); clearTimeout(tid); resolve(); }
+                        } catch (e)         { clearInterval(id); clearTimeout(tid); reject(e); }
                     }, checkInterval);
                 });
             },
 
             async openHCaptchaWhenVisible(timeout = 15) {
                 const iframe = await Waiters.waitForElement(
-                    '>CSS> iframe[src*="hcaptcha.com"]', timeout, true
-                );
+                    '>CSS> iframe[src*="hcaptcha.com"]', timeout, true);
                 if (!iframe) return false;
                 try { window.hcaptcha.execute(); return true; }
-                catch (e) { console.warn('[SLM] hcaptcha.execute() falló:', e.message); return false; }
+                catch (e) { console.warn('[SLM] hcaptcha.execute() failed:', e.message); return false; }
             }
         };
     })();
 
     // =========================================================================
-    // 6. DOCUMENT SMART CONTROLLER
+    // 7. DOCUMENT SMART CONTROLLER
     // =========================================================================
     const DocumentSmartController = (() => {
         const ORIG = {
@@ -464,30 +505,36 @@
 
         const blocked = { focus: false, hidden: false, visibilityState: false, activeElement: false };
 
-        function defineProp(target, prop, descriptor) {
+        // null      → inactivo, listeners no hacen nada (páginas normales sin impacto)
+        // 'visible' | 'invisible' → re-aplica si la página intenta revertirlo
+        let _persistMode         = null;
+        let _persistentListeners = false;
+
+        const defineProp = (target, prop, descriptor) => {
             try {
                 Object.defineProperty(target, prop, { configurable: true, enumerable: true, ...descriptor });
                 return true;
             } catch { return false; }
-        }
+        };
 
-        function warn(prop) {
-            console.log(`%c⛔ [SLM] uBO controla "${prop}" — no modificable`, 'color:#ff6600');
-        }
+        const warn = prop =>
+            console.log(`%c⛔ [SLM] uBO controls "${prop}" — cannot modify`, 'color:#ff6600');
 
+        // ── Detección de uBlock Origin ────────────────────────────────────────
         const UBO = {
+            _SIGS: ['setConstant','trapProp','thisScript','normalValue','cloakFunc','logPrefix'],
+
             _hasSignature(getter) {
                 if (!getter) return false;
                 const s = getter.toString();
-                return ['setConstant','trapProp','thisScript','normalValue','cloakFunc','logPrefix']
-                    .some(sig => s.includes(sig));
+                return this._SIGS.some(sig => s.includes(sig));
             },
 
             detectActiveElement() {
-                if (Array.isArray(window.uBO_scriptletsInjected))
-                    if (window.uBO_scriptletsInjected.some(s =>
+                if (Array.isArray(window.uBO_scriptletsInjected) &&
+                    window.uBO_scriptletsInjected.some(s =>
                         s.includes('activeElement') || s.includes('trusted-set') || s.includes('"tagName"')))
-                        return true;
+                    return true;
 
                 const desc = Object.getOwnPropertyDescriptor(document, 'activeElement');
                 if (desc?.get && this._hasSignature(desc.get)) return true;
@@ -514,11 +561,11 @@
                 }
 
                 if (Array.isArray(window.uBO_scriptletsInjected)) {
-                    window.uBO_scriptletsInjected.forEach(s => {
-                        if (s.includes('hasFocus'))                                         blocked.focus           = true;
+                    for (const s of window.uBO_scriptletsInjected) {
+                        if (s.includes('hasFocus'))                                          blocked.focus           = true;
                         if (s.includes('visibilitychange') || s.includes('visibilityState')) blocked.visibilityState = true;
-                        if (s.includes('hidden') && !s.includes('visibility'))              blocked.hidden          = true;
-                    });
+                        if (s.includes('hidden') && !s.includes('visibility'))               blocked.hidden          = true;
+                    }
                 }
             }
         };
@@ -527,6 +574,7 @@
             try { document.dispatchEvent(new Event('visibilitychange')); } catch {}
         };
 
+        // ── Setters ───────────────────────────────────────────────────────────
         const Props = {
             setFocus(mode) {
                 if (blocked.focus) return warn('hasFocus'), false;
@@ -535,14 +583,12 @@
                 Document.prototype.hasFocus = fn;
                 return true;
             },
-
             setHidden(value) {
                 if (blocked.hidden) return warn('hidden'), false;
                 if (value === 'original')
                     return ORIG.hidden ? defineProp(document, 'hidden', { get: ORIG.hidden }) : false;
                 return defineProp(document, 'hidden', { get: () => value });
             },
-
             setVisibilityState(value) {
                 if (blocked.visibilityState) return warn('visibilityState'), false;
                 if (value === 'original')
@@ -551,13 +597,10 @@
                         : false;
                 return defineProp(document, 'visibilityState', { get: () => value });
             },
-
             setActiveElement(tagName) {
                 if (blocked.activeElement) return warn('activeElement'), false;
                 if (tagName === 'original')
-                    return ORIG.activeElement
-                        ? defineProp(document, 'activeElement', ORIG.activeElement)
-                        : false;
+                    return ORIG.activeElement ? defineProp(document, 'activeElement', ORIG.activeElement) : false;
 
                 const tag  = tagName.toUpperCase();
                 const fake = {
@@ -571,35 +614,29 @@
                     textContent: '', innerText: '', value: '', checked: false,
                     disabled: false, readOnly: false, src: '', href: '', type: '',
                     getAttribute:          () => null, setAttribute:       () => {},
-                    removeAttribute:       () => {}, hasAttribute:         () => false,
+                    removeAttribute:       () => {},   hasAttribute:       () => false,
                     hasAttributes:         () => false,
                     getBoundingClientRect: () => ({ top:0, left:0, bottom:0, right:0, width:0, height:0 }),
-                    getClientRects:        () => [], matches:              () => false,
-                    closest:               () => null, contains:           () => false,
-                    querySelector:         () => null, querySelectorAll:   () => []
+                    getClientRects: () => [], matches:      () => false, closest:        () => null,
+                    contains:       () => false, querySelector: () => null, querySelectorAll: () => []
                 };
                 return defineProp(document, 'activeElement', { get: () => fake });
             }
         };
 
-        function _getStatus() {
-            return {
-                ubo: { ...blocked },
-                values: {
-                    focus:           document.hasFocus(),
-                    hidden:          document.hidden,
-                    visibilityState: document.visibilityState,
-                    activeElement:   document.activeElement?.tagName || 'N/A'
-                }
-            };
-        }
+        const _getStatus = () => ({
+            ubo: { ...blocked },
+            values: {
+                focus:           document.hasFocus(),
+                hidden:          document.hidden,
+                visibilityState: document.visibilityState,
+                activeElement:   document.activeElement?.tagName || 'N/A'
+            }
+        });
 
+        // ── API ───────────────────────────────────────────────────────────────
         const api = {
-            status() {
-                const s = _getStatus();
-                console.log('📊 [SLM] Document status:', s);
-                return s;
-            },
+            status()   { const s = _getStatus(); console.log('📊 [SLM] Document status:', s); return s; },
             getStatus: _getStatus,
 
             focus: {
@@ -630,24 +667,63 @@
                 set:   tag => Props.setActiveElement(tag),
                 original: () => Props.setActiveElement('original')
             },
+
             visible() {
+                _persistMode = 'visible';
                 if (!blocked.focus)           Props.setFocus('true');
                 if (!blocked.hidden)          Props.setHidden(false);
                 if (!blocked.visibilityState) Props.setVisibilityState('visible');
                 triggerVis();
             },
+
             invisible() {
+                _persistMode = 'invisible';
                 if (!blocked.focus)           Props.setFocus('false');
                 if (!blocked.hidden)          Props.setHidden(true);
                 if (!blocked.visibilityState) Props.setVisibilityState('hidden');
                 triggerVis();
             },
+
             reset() {
+                _persistMode = null;
                 if (!blocked.focus)           Props.setFocus('original');
                 if (!blocked.hidden)          Props.setHidden('original');
                 if (!blocked.visibilityState) Props.setVisibilityState('original');
                 if (!blocked.activeElement)   Props.setActiveElement('original');
                 triggerVis();
+            },
+
+            // ─────────────────────────────────────────────────────────────────
+            // persist() — registra 3 listeners UNA sola vez.
+            // • Solo actúan si _persistMode !== null → sin impacto en páginas
+            //   normales donde nadie llama visible()/invisible().
+            // • _applying previene recursión infinita:
+            //   invisible() → triggerVis() → 'visibilitychange' → listener
+            //   → _applying=true → return → sin recursión.
+            // • No usa Object.defineProperty → no choca con uBO.
+            // ─────────────────────────────────────────────────────────────────
+            persist() {
+                if (_persistentListeners) return;
+                _persistentListeners = true;
+
+                let _applying = false;
+
+                const _reapply = () => {
+                    if (_applying || _persistMode === null) return;
+                    _applying = true;
+                    try {
+                        if      (_persistMode === 'invisible') api.invisible();
+                        else if (_persistMode === 'visible')   api.visible();
+                    } finally {
+                        _applying = false;
+                    }
+                };
+
+                document.addEventListener('visibilitychange', _reapply, true);
+                window.addEventListener('focus',              _reapply, true);
+                window.addEventListener('blur',               _reapply, true);
+
+                console.log('[SLM] DocumentSmartController: persistent listeners registered');
             }
         };
 
@@ -656,45 +732,42 @@
     })();
 
     // =========================================================================
-    // 7. SAFE HELPERS
+    // 8. SAFE HELPERS
     // =========================================================================
     function safeProp(propKey, setterFn, label) {
         try {
-            const st = DocumentSmartController.getStatus();
-            if (st.ubo[propKey]) { console.log(`ℹ️ [SLM] uBO bloquea ${label}`); return false; }
+            if (DocumentSmartController.getStatus().ubo[propKey]) {
+                console.log(`ℹ️ [SLM] uBO blocks ${label}`);
+                return false;
+            }
             setterFn();
             return true;
         } catch (e) {
-            console.warn(`⚠️ [SLM] Error en safe${label}: ${e.message}`);
+            console.warn(`⚠️ [SLM] Error in safe${label}: ${e.message}`);
             return false;
         }
     }
 
     window.safeSetFocus = v =>
         safeProp('focus', () => {
-            const fn = DocumentSmartController.focus[v];
-            if (fn) fn(); else DocumentSmartController.focus.original();
+            (DocumentSmartController.focus[v] ?? DocumentSmartController.focus.original)();
         }, 'focus');
 
     window.safeSetHidden = v =>
         safeProp('hidden', () => {
-            const fn = DocumentSmartController.hidden[v];
-            if (fn) fn(); else DocumentSmartController.hidden.original();
+            (DocumentSmartController.hidden[v] ?? DocumentSmartController.hidden.original)();
         }, 'hidden');
 
     window.safeSetVisibilityState = v =>
         safeProp('visibilityState', () => {
-            const fn = DocumentSmartController.state[v];
-            if (fn) fn(); else DocumentSmartController.state.original();
+            (DocumentSmartController.state[v] ?? DocumentSmartController.state.original)();
         }, 'visibilityState');
 
     window.safeSetActiveElement = tag =>
         safeProp('activeElement', () => DocumentSmartController.active.set(tag), 'activeElement');
 
-    const _activeTags = ['Iframe','Div','Body','Input','Button','A','Span'];
-    _activeTags.forEach(tag => {
+    for (const tag of ['Iframe','Div','Body','Input','Button','A','Span'])
         window[`safeActive${tag}`] = () => window.safeSetActiveElement(tag.toUpperCase());
-    });
     window.safeActiveOriginal = () => window.safeSetActiveElement('original');
 
     window.safeVisible       = () => { try { DocumentSmartController.visible();   return true; } catch { return false; } };
@@ -704,7 +777,7 @@
     window.safeDetectUBO     = () => console.log('🔍 uBO:', DocumentSmartController.getStatus().ubo);
 
     // =========================================================================
-    // 8. ROUTER
+    // 9. ROUTER
     // =========================================================================
     const Router = {
         routes: [],
@@ -715,35 +788,30 @@
         },
 
         async run() {
-            const host = location.hostname;
-            const href = location.href;
-
+            const { hostname: host, href, pathname } = location;
             if (!/^https?:\/\/.+/.test(href)) return;
 
             const matches = this.routes.filter(r => {
-                const domainMatch = typeof r.domain === 'string'
+                const hit = typeof r.domain === 'string'
                     ? host.includes(r.domain)
                     : r.domain.test(href);
-                if (!domainMatch) return false;
-                if (r.options.path && !location.pathname.includes(r.options.path)) return false;
-                return true;
+                return hit && (!r.options.path || pathname.includes(r.options.path));
             });
 
-            if (!matches.length) return;
-
-            for (const match of matches) {
-                console.log(`✅ [SLM] Ejecutando: ${match.domain}`);
-                try { await match.handler(); }
-                catch (e) { console.error(`[SLM] Error en ${match.domain}:`, e); }
+            for (const m of matches) {
+                console.log(`✅ [SLM] Running: ${m.domain} (${pathname})`);
+                try { await m.handler(); }
+                catch (e) { console.error(`[SLM] Error in ${m.domain}:`, e); }
             }
         }
     };
 
     // =========================================================================
-    // 9. SITE SCRIPTS
+    // 10. SITE SCRIPTS
     // =========================================================================
     const SiteScripts = {
         register() {
+
             Router.register(
                 ['barlianta.com','jobpagol.com','cararabic.com','teknoventure.biz.id',
                  'postalcode.com.pk','esladvice.com','progame.biz.id'],
@@ -818,14 +886,14 @@
                 await Waiters.waitForElement('>CSS> .box-main, .verify-wrapper', 10, true);
 
                 if (Browser.elementExists('>CSS> .h-captcha')) {
-                    console.log('[SLM] fc-lc: hCaptcha detectado');
+                    console.log('[SLM] fc-lc: hCaptcha detected');
                     await Captcha.waitForResolutionPromise(60);
                     await Waiters.waitForElement('>CSS> #hCaptchaShortlink', 10, true);
                     await Browser.click('>CSS> #hCaptchaShortlink');
                 }
 
                 if (Browser.elementExists('>CSS> #turnstile-container')) {
-                    console.log('[SLM] fc-lc: Turnstile detectado');
+                    console.log('[SLM] fc-lc: Turnstile detected');
                     await Captcha.waitForResolutionPromise(60);
                     await Waiters.waitForElement('>CSS> #submitBtn', 10, true);
                     await Browser.click('>CSS> #submitBtn');
@@ -834,6 +902,7 @@
 
             Router.register(['jobzhub.store'], async () => {
                 await Waiters.waitForElement('>CSS> #next, #countdown', 10, true);
+
                 if (Browser.elementExists('>CSS> #countdown', true)) {
                     await Waiters.waitForElement(
                         '>XPATH> //*[@id="timer"][number(text()) = number(text())]', 10, true);
@@ -844,6 +913,7 @@
                     await Waiters.waitForElement('>CSS> #surl', 10, true);
                     await Browser.click('>CSS> #surl');
                 }
+
                 await Browser.click('>CSS> #next');
                 await Waiters.waitForElement(
                     '>XPATH> //*[@id="next" and contains(text(), "Please Wait")]', 10, true);
@@ -855,38 +925,54 @@
                 await Waiters.waitForElement('>CSS> #glink', 10, true);
                 await Browser.click('>CSS> #glink');
             });
+
+            Router.register('viefaucet.com', async () => {
+                safeInvisible();
+                Browser.blockPopups();
+
+                console.log('[SLM] viefaucet: invisible mode + popups blocked');
+
+                SPAManager.onLeave(() => {
+                    safeResetDocument();
+                    Browser.restorePopups();
+                    console.log('[SLM] viefaucet: state restored');
+                });
+
+            }, { path: '/ptc/window' });
         }
     };
 
     // =========================================================================
-    // 10. API PÚBLICA
+    // 11. PUBLIC API
     // =========================================================================
     window.SLM = {
-        version: '4.4',
+        version: '4.6',
         config:  Config.settings,
         waiters: {
-            sleep:      Waiters.sleep.bind(Waiters),
-            element:    Waiters.waitForElement.bind(Waiters),
-            anyVisible: Waiters.waitForAnyVisible.bind(Waiters),
-            any:        Waiters.waitForAny.bind(Waiters),
-            hide:       Waiters.waitForHide.bind(Waiters),
-            text:       Waiters.waitForText.bind(Waiters)
+            sleep:      ms     => Waiters.sleep(ms),
+            element:    (...a) => Waiters.waitForElement(...a),
+            anyVisible: (...a) => Waiters.waitForAnyVisible(...a),
+            any:        (...a) => Waiters.waitForAny(...a),
+            hide:       (...a) => Waiters.waitForHide(...a),
+            text:       (...a) => Waiters.waitForText(...a)
         },
         browser: {
-            get:              Browser.getElement.bind(Browser),
-            exists:           Browser.elementExists.bind(Browser),
-            click:            Browser.click.bind(Browser),
-            text:             Browser.getText.bind(Browser),
-            redirect:         (url) => Browser.redirect(url),
-            popupsToRedirects:() => Browser.popupsToRedirects()
+            get:               (...a) => Browser.getElement(...a),
+            exists:            (...a) => Browser.elementExists(...a),
+            click:             (...a) => Browser.click(...a),
+            text:              (...a) => Browser.getText(...a),
+            redirect:          url   => Browser.redirect(url),
+            popupsToRedirects: ()    => Browser.popupsToRedirects(),
+            blockPopups:       ()    => Browser.blockPopups(),
+            restorePopups:     ()    => Browser.restorePopups()
         },
         string: {
-            toNumber:     StringUtils.toNumber,
-            between:      StringUtils.getBetween,
-            decodeBase64: StringUtils.decodeBase64,
-            encodeBase64: StringUtils.encodeBase64,
+            toNumber:     StringUtils.toNumber.bind(StringUtils),
+            between:      StringUtils.getBetween.bind(StringUtils),
+            decodeBase64: StringUtils.decodeBase64.bind(StringUtils),
+            encodeBase64: StringUtils.encodeBase64.bind(StringUtils),
             rot13:        StringUtils.rot13,
-            extractUrl:   StringUtils.extractUrl,
+            extractUrl:   StringUtils.extractUrl.bind(StringUtils),
             getParam:     StringUtils.getUrlParam,
             getAllParams:  StringUtils.getAllUrlParams
         },
@@ -895,12 +981,15 @@
             isResolved:   () => Captcha.isResolved(),
             wait:         (cb, interval, max) => Captcha.waitForResolution(cb, interval, max),
             waitPromise:  (timeout, interval) => Captcha.waitForResolutionPromise(timeout, interval),
-            openHCaptcha: (timeout) => Captcha.openHCaptchaWhenVisible(timeout)
+            openHCaptcha: timeout => Captcha.openHCaptchaWhenVisible(timeout)
         },
         document: DocumentSmartController,
         router: {
-            register: Router.register.bind(Router),
-            run:      Router.run.bind(Router)
+            register: (d, h, o) => Router.register(d, h, o),
+            run:      ()        => Router.run()
+        },
+        spa: {
+            onLeave: fn => SPAManager.onLeave(fn)
         },
         safe: {
             focus:          safeSetFocus,
@@ -924,11 +1013,19 @@
     };
 
     // =========================================================================
-    // 11. INICIO
+    // 12. INIT
     // =========================================================================
     (async () => {
         await Config.detectOptimalSettings();
         SiteScripts.register();
+
+        // persist() — listeners globales sin efecto hasta que alguien llame
+        // safeVisible/safeInvisible. No impacta páginas normales.
+        DocumentSmartController.persist();
+
+        // SPAManager — intercepta pushState/replaceState/popstate para
+        // re-ejecutar el Router y limpiar estado en cada navegación SPA.
+        SPAManager.init();
 
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', () => Router.run(), { once: true });
@@ -936,14 +1033,13 @@
             setTimeout(() => Router.run(), 50);
         }
 
-        const { ubo } = DocumentSmartController.getStatus();
-        const uboCount  = Object.values(ubo).filter(Boolean).length;
+        const { ubo }    = DocumentSmartController.getStatus();
         const uboBlocked = Object.keys(ubo).filter(k => ubo[k]);
         console.log(
-            '%c✅ [SLM] v4.4 listo — window.SLM disponible',
+            '%c✅ [SLM] v4.6 ready — window.SLM available',
             'background:#00aa00;color:white;padding:2px 5px;border-radius:3px'
         );
-        if (uboCount > 0)
-            console.log(`%c⚠️ uBO bloquea ${uboCount} propiedad(es): ${uboBlocked.join(', ')}`, 'color:#ffaa00');
+        if (uboBlocked.length)
+            console.log(`%c⚠️ uBO blocks ${uboBlocked.length} property(ies): ${uboBlocked.join(', ')}`, 'color:#ffaa00');
     })();
 })();
