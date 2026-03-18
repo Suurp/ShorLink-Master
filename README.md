@@ -2,7 +2,7 @@
 
 > A professional userscript framework for bypassing shortlinks with full browser document control.
 
-[![Version](https://img.shields.io/badge/version-4.4-blue.svg)](https://github.com/tu-usuario/shortlink-master)
+[![Version](https://img.shields.io/badge/version-4.6-blue.svg)](https://github.com/tu-usuario/shortlink-master)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Tampermonkey](https://img.shields.io/badge/Tampermonkey-compatible-orange.svg)](https://www.tampermonkey.net/)
 [![Violentmonkey](https://img.shields.io/badge/Violentmonkey-compatible-purple.svg)](https://violentmonkey.github.io/)
@@ -24,6 +24,7 @@
   - [SLM.document](#slmdocument)
   - [SLM.safe](#slmsafe)
   - [SLM.router](#slmrouter)
+  - [SLM.spa](#slmspa)
 - [Adding a New Site](#adding-a-new-site)
 - [Usage Examples](#usage-examples)
 - [Selector System](#selector-system)
@@ -37,8 +38,9 @@
 SLM is a Tampermonkey/Violentmonkey userscript that provides a modular framework for automating shortlink bypasses. It includes:
 
 - **Router** — multi-site routing with support for strings, RegExp and path-specific handlers
+- **SPAManager** — detects SPA navigations (pushState, replaceState, popstate) and re-runs the Router automatically, executing registered cleanup functions on path change
 - **Waiters** — async waiting with timeout, adaptive backoff and text/condition support
-- **Browser** — smart DOM cache that automatically invalidates disconnected nodes
+- **Browser** — smart DOM cache that automatically invalidates disconnected nodes, plus `blockPopups` / `restorePopups` for `window.open` control
 - **Document Smart Controller** — manipulate `hasFocus`, `hidden`, `visibilityState` and `activeElement` with automatic uBlock Origin interference detection
 - **Captcha** — unified detection and resolution waiting for hCaptcha, reCAPTCHA, Cloudflare Turnstile and IconCaptcha
 - **String Utils** — base64, ROT13 and obfuscated URL extraction helpers
@@ -113,11 +115,12 @@ These filters are specifically tuned for shortlink sites and complement SLM dire
 ## Architecture
 
 ```
-SLM v4.4
+SLM v4.6
 ├── Config          — Automatic performance detection and interval tuning
 ├── Cache           — Selector/XPath cache with TTL and live node validation
+├── SPAManager      — SPA navigation detection (pushState/replaceState/popstate) + cleanup registry
 ├── Waiters         — Async waiting (element, visibility, text, hide)
-├── Browser         — DOM interaction (get, exists, click, getText, redirect)
+├── Browser         — DOM interaction (get, exists, click, getText, redirect, blockPopups)
 ├── StringUtils     — Text utilities (numbers, base64, ROT13, URL extraction)
 ├── Captcha         — Unified hCaptcha/reCAPTCHA/Turnstile detection and waiting
 ├── DocumentSmartController — focus/hidden/visibilityState/activeElement control
@@ -280,6 +283,41 @@ Intercepts `window.open()` so that instead of opening a popup it redirects in th
 SLM.browser.popupsToRedirects();
 // From now on, window.open('url') redirects instead of opening a popup
 ```
+
+---
+
+#### `SLM.browser.blockPopups()`
+
+Replaces `window.open()` with a **fake window** that silently does nothing. Unlike `popupsToRedirects()`, this does not cause any navigation — the popup is simply swallowed. The fake window implements the minimum interface that sites typically inspect (`closed`, `opener`, `close`, `focus`, `location`, `postMessage`) so that no errors are thrown when the site tries to interact with the returned object.
+
+The original `window.open` is saved once at script load time, so calling `blockPopups()` multiple times is safe and idempotent.
+
+```javascript
+SLM.browser.blockPopups();
+// window.open() now returns a fake window and opens nothing
+```
+
+---
+
+#### `SLM.browser.restorePopups()`
+
+Restores `window.open()` to the original browser implementation captured at script load time.
+
+```javascript
+SLM.browser.restorePopups();
+// window.open() behaves normally again
+```
+
+Typical usage with `SPAManager.onLeave()` to auto-restore when leaving a path:
+
+```javascript
+Router.register('example.com', async () => {
+    SLM.browser.blockPopups();
+
+    SLM.spa.onLeave(() => {
+        SLM.browser.restorePopups(); // runs automatically on SPA navigation
+    });
+}, { path: '/ptc' });
 
 ---
 
@@ -543,6 +581,53 @@ SLM.router.register('example.com', linkHandler,     { path: '/go' });
 
 ---
 
+### SLM.spa
+
+SPA navigation manager. Detects URL changes caused by `pushState`, `replaceState`, `popstate` and DOM mutations, then re-runs the Router and executes any registered cleanup functions.
+
+#### `SLM.spa.onLeave(fn)`
+
+Registers a cleanup function that runs **once** the next time the user navigates away from the current path. After it runs it is removed — it will not fire again unless re-registered.
+
+Use this inside a site script handler to undo any side effects (document state changes, `window.open` overrides, timers, etc.) that should not persist across SPA navigations.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `fn` | `function` | Called once when the path changes away from the current one |
+
+```javascript
+Router.register('my-spa.com', async () => {
+    // Apply side effects
+    SLM.safe.invisible();
+    SLM.browser.blockPopups();
+
+    // Register cleanup — runs automatically when the user leaves this path
+    SLM.spa.onLeave(() => {
+        SLM.safe.reset();
+        SLM.browser.restorePopups();
+    });
+}, { path: '/ptc/window' });
+```
+
+You can register multiple `onLeave` calls — they all run in order:
+
+```javascript
+SLM.spa.onLeave(() => SLM.safe.reset());
+SLM.spa.onLeave(() => SLM.browser.restorePopups());
+SLM.spa.onLeave(() => console.log('cleanup done'));
+```
+
+**How SPAManager detects navigation:**
+
+| Mechanism | Covers |
+|-----------|--------|
+| `history.pushState` intercept | React Router, Vue Router, Next.js, etc. |
+| `history.replaceState` intercept | Programmatic URL replacement |
+| `window.popstate` listener | Browser back / forward buttons |
+| `MutationObserver` fallback | Hash routing and frameworks that mutate the DOM without history API |
+
+---
+
 ## Adding a New Site
 
 To add support for a new shortlink, edit the `SiteScripts.register()` section and add a `Router.register` call:
@@ -702,10 +787,27 @@ await SLM.browser.click(">XPATH> //a[contains(text(), 'Get Link')]");
 | luckywatch.pro | — | — | — |
 | fc-lc.xyz | hCaptcha / Turnstile | — | — |
 | jobzhub.store | Captcha | ✅ | — |
+| viefaucet.com | — | — | — |
 
 ---
 
 ## Changelog
+
+### v4.6
+- Added `SPAManager` — detects SPA navigations via `pushState`, `replaceState`, `popstate` and `MutationObserver`, re-runs Router on path change with debounce
+- Added `SPAManager.onLeave(fn)` — registers cleanup functions that run automatically when leaving the current path
+- Added `Browser.blockPopups()` — replaces `window.open` with a fully-typed fake window (idempotent, safe to call multiple times)
+- Added `Browser.restorePopups()` — restores the original `window.open` captured at script load time
+- `SLM.spa.onLeave` exposed in public API
+- `SLM.browser.blockPopups` and `SLM.browser.restorePopups` exposed in public API
+- Added support for `viefaucet.com` (SPA, `/ptc/window` path, invisible mode + popup blocking)
+- Version bumped to 4.6
+
+### v4.5
+- Added `DocumentSmartController.persist()` — global listeners that re-apply `visible`/`invisible` mode if the page tries to revert it
+- Fix: infinite recursion in `persist()` listeners — added `_applying` re-entrancy guard
+- `_persistMode` state: `null` (inactive), `'visible'`, `'invisible'` — no impact on normal pages
+- `reset()` now clears `_persistMode`
 
 ### v4.4
 - Added `Waiters.waitForAny` — waits for DOM existence without requiring visibility
