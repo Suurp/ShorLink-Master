@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         ShortLink Master (SLM) + Document Controller
-// @version      4.6
-// @description  Professional framework for shortlink bypassing + full document control
+// @name         ShortLink Master (SLM)
+// @version      4.8
+// @description  Professional framework for shortlink bypassing
 // @match        *://*/*
 // @grant        none
 // @run-at       document-start
@@ -67,12 +67,161 @@
     setInterval(() => Cache.cleanup(), 300_000);
 
     // =========================================================================
-    // 2. SPA MANAGER
+    // 2. UBO OVERRIDE ENGINE
+    // =========================================================================
+    const UBOOverride = (() => {
+        const SIGS = [
+            'setConstant', 'trapProp', 'thisScript', 'normalValue',
+            'cloakFunc', 'logPrefix', 'noopFunc', 'trueFunc', 'falseFunc'
+        ];
+
+        const _cache    = new Map();
+        const _origOpen = window.open;
+
+        const _hasSignature = fn => {
+            if (typeof fn !== 'function') return false;
+            try { return SIGS.some(sig => fn.toString().includes(sig)); }
+            catch { return false; }
+        };
+
+        const _tryInstance = (obj, prop, descriptor) => {
+            try {
+                Object.defineProperty(obj, prop, { configurable: true, enumerable: true, ...descriptor });
+                return true;
+            } catch { return false; }
+        };
+
+        const _tryPrototype = (proto, prop, descriptor) => {
+            try {
+                Object.defineProperty(proto, prop, { configurable: true, enumerable: true, ...descriptor });
+                return true;
+            } catch { return false; }
+        };
+
+        const _tryDeleteRedefine = (obj, prop, descriptor) => {
+            try {
+                const prev = Object.getOwnPropertyDescriptor(obj, prop);
+                if (!prev?.configurable) return false;
+                delete obj[prop];
+                Object.defineProperty(obj, prop, { configurable: true, enumerable: true, ...descriptor });
+                return true;
+            } catch { return false; }
+        };
+
+        const _tryProtoProxy = (obj, proto, prop, descriptor) => {
+            try {
+                const getter = descriptor.get || (() => descriptor.value);
+                const protoProxy = new Proxy(proto, {
+                    get(target, p, receiver) {
+                        if (p === prop) return getter.call(receiver);
+                        return Reflect.get(target, p, receiver);
+                    },
+                    set(target, p, value, receiver) {
+                        if (p === prop) return true;
+                        return Reflect.set(target, p, value, receiver);
+                    }
+                });
+                Object.setPrototypeOf(obj, protoProxy);
+                return true;
+            } catch { return false; }
+        };
+
+        const _verify = (obj, prop, descriptor) => {
+            try {
+                if (descriptor.get) {
+                    const sentinel = {};
+                    const testGet  = () => sentinel;
+                    Object.defineProperty(obj, prop, { get: testGet, configurable: true });
+                    const works = obj[prop] === sentinel;
+                    Object.defineProperty(obj, prop, { configurable: true, enumerable: true, ...descriptor });
+                    return works;
+                }
+                if (descriptor.value !== undefined) return obj[prop] === descriptor.value;
+                return true;
+            } catch { return false; }
+        };
+
+        const _override = (obj, proto, prop, descriptor) => {
+            if (_tryInstance(obj, prop, descriptor) && _verify(obj, prop, descriptor)) {
+                console.log(`%c✅ [SLM] Override T1 (instance): "${prop}"`, 'color:#00cc66');
+                return 'overridden';
+            }
+            if (_tryPrototype(proto, prop, descriptor) && _verify(obj, prop, descriptor)) {
+                console.log(`%c✅ [SLM] Override T2 (prototype): "${prop}"`, 'color:#00cc66');
+                return 'overridden';
+            }
+            if (_tryDeleteRedefine(obj, prop, descriptor) && _verify(obj, prop, descriptor)) {
+                console.log(`%c✅ [SLM] Override T3 (delete+redefine): "${prop}"`, 'color:#00cc66');
+                return 'overridden';
+            }
+            if (_tryProtoProxy(obj, proto, prop, descriptor) && _verify(obj, prop, descriptor)) {
+                console.log(`%c✅ [SLM] Override T4 (proto proxy): "${prop}"`, 'color:#00cc66');
+                return 'overridden';
+            }
+
+            try {
+                const desc = Object.getOwnPropertyDescriptor(obj, prop) ||
+                             Object.getOwnPropertyDescriptor(proto, prop);
+                if (desc && !desc.configurable) {
+                    console.log(`%c⛔ [SLM] Override IMPOSSIBLE (non-configurable): "${prop}"`, 'color:#ff4444');
+                    return 'impossible';
+                }
+            } catch {}
+
+            console.log(`%c⚠️ [SLM] Override FAILED (likely Proxy): "${prop}"`, 'color:#ffaa00');
+            return 'proxied';
+        };
+
+        return {
+            results: {},
+
+            overrideDocumentProp(prop, descriptor) {
+                const key = `doc.${prop}`;
+                if (this.results[key] === 'impossible') return 'impossible';
+                const result = _override(document, Document.prototype, prop, descriptor);
+                this.results[key] = result;
+                return result;
+            },
+
+            overrideWindowProp(prop, value) {
+                const key = `win.${prop}`;
+                if (this.results[key] === 'impossible') return 'impossible';
+
+                try {
+                    window[prop] = value;
+                    if (window[prop] === value) {
+                        console.log(`%c✅ [SLM] Override window.${prop}`, 'color:#00cc66');
+                        this.results[key] = 'overridden';
+                        return 'overridden';
+                    }
+                } catch {}
+
+                const result = _override(window, Window.prototype, prop, { value, writable: true });
+                this.results[key] = result;
+                return result;
+            },
+
+            isOverridden(key)       { return this.results[key] === 'overridden'; },
+            isTrulyImpossible(key)  { return this.results[key] === 'impossible'; },
+
+            clearCache() {
+                _cache.clear();
+                for (const k of Object.keys(this.results))
+                    if (this.results[k] !== 'impossible') delete this.results[k];
+            },
+
+            get origOpen()   { return _origOpen; },
+            get signatures() { return [...SIGS]; }
+        };
+    })();
+
+    // =========================================================================
+    // 3. SPA MANAGER
     // =========================================================================
     const SPAManager = (() => {
         let _lastPath   = location.pathname;
-        let _cleanups   = [];   
-        let _debounceId = null; 
+        let _cleanups   = [];
+        let _debounceId = null;
 
         const _onChange = () => {
             const newPath = location.pathname;
@@ -82,6 +231,7 @@
             _lastPath = newPath;
 
             Cache.clear();
+            UBOOverride.clearCache();
 
             for (const fn of _cleanups) {
                 try { fn(); } catch (e) { console.warn('[SLM] SPA cleanup error:', e); }
@@ -123,7 +273,7 @@
     })();
 
     // =========================================================================
-    // 3. WAITERS
+    // 4. WAITERS
     // =========================================================================
     const Waiters = {
         sleep: ms => new Promise(r => setTimeout(r, ms)),
@@ -203,7 +353,7 @@
     };
 
     // =========================================================================
-    // 4. BROWSER
+    // 5. BROWSER
     // =========================================================================
     const TOKEN_RE = />(CSS|MATCH|XPATH|AT|FRAME|SHADOW)>/g;
 
@@ -330,41 +480,36 @@
             console.log('[SLM] window.open → redirects instead of popup');
         },
 
-        _origOpen: window.open,
-
-        blockPopups() {
-            // No sobreescribir si ya está bloqueado
-            if (window.open === this._fakeOpen) return;
-            console.log('[SLM] window.open → blocked (fake window)');
-            window.open = this._fakeOpen;
-        },
-
-        restorePopups() {
-            window.open = this._origOpen;
-            console.log('[SLM] window.open → restored');
-        },
-
         _fakeOpen: () => new Proxy(
             {
-                closed:   false,
-                opener:   null,
-                name:     '',
+                closed: false, opener: null, name: '',
                 location: { href: 'about:blank', replace: () => {} },
-                close:    () => {},
-                focus:    () => {},
-                blur:     () => {},
-                print:    () => {},
-                postMessage: () => {}
+                close: () => {}, focus: () => {}, blur: () => {},
+                print: () => {}, postMessage: () => {}
             },
             {
                 get: (t, p) => (p in t ? t[p] : undefined),
                 set: (t, p, v) => { t[p] = v; return true; }
             }
-        )
+        ),
+
+        blockPopups() {
+            if (window.open === this._fakeOpen) return;
+            const result = UBOOverride.overrideWindowProp('open', this._fakeOpen);
+            if (result === 'impossible')
+                console.log('%c⛔ [SLM] window.open: non-configurable, cannot override', 'color:#ff4444');
+            else
+                console.log('[SLM] window.open → blocked (fake window)');
+        },
+
+        restorePopups() {
+            UBOOverride.overrideWindowProp('open', UBOOverride.origOpen);
+            console.log('[SLM] window.open → restored');
+        }
     };
 
     // =========================================================================
-    // 5. STRING UTILS
+    // 6. STRING UTILS
     // =========================================================================
     const StringUtils = {
         toNumber(str, dec = -1, dS = '.', tS = '') {
@@ -414,7 +559,7 @@
     };
 
     // =========================================================================
-    // 6. CAPTCHA
+    // 7. CAPTCHA
     // =========================================================================
     const Captcha = (() => {
         const safeGetResponse = obj => {
@@ -422,15 +567,11 @@
         };
 
         const PRESENT_SELECTORS = [
-            '>CSS> .cf-turnstile',
-            '>CSS> .g-recaptcha',
-            '>CSS> .h-captcha',
-            '>CSS> iframe[src*="hcaptcha.com"]',
-            '>CSS> iframe[src*="recaptcha"]',
+            '>CSS> .cf-turnstile', '>CSS> .g-recaptcha', '>CSS> .h-captcha',
+            '>CSS> iframe[src*="hcaptcha.com"]', '>CSS> iframe[src*="recaptcha"]',
             '>CSS> input[name="cf-turnstile-response"]'
         ];
 
-        // [value!=""] requiere XPath — no es CSS estándar
         const _resolved = () => {
             try {
                 return (
@@ -448,7 +589,6 @@
                 try { return PRESENT_SELECTORS.some(sel => Browser.elementExists(sel)); }
                 catch { return false; }
             },
-
             isResolved: _resolved,
 
             waitForResolution(callback, checkInterval = 1000, maxAttempts = 120) {
@@ -493,7 +633,7 @@
     })();
 
     // =========================================================================
-    // 7. DOCUMENT SMART CONTROLLER
+    // 8. DOCUMENT SMART CONTROLLER
     // =========================================================================
     const DocumentSmartController = (() => {
         const ORIG = {
@@ -503,68 +643,44 @@
             visibilityState: Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState')?.get,
         };
 
-        const blocked = { focus: false, hidden: false, visibilityState: false, activeElement: false };
+        const status = { focus: false, hidden: false, visibilityState: false, activeElement: false };
 
-        // null      → inactivo, listeners no hacen nada (páginas normales sin impacto)
-        // 'visible' | 'invisible' → re-aplica si la página intenta revertirlo
         let _persistMode         = null;
         let _persistentListeners = false;
 
         const defineProp = (target, prop, descriptor) => {
-            try {
-                Object.defineProperty(target, prop, { configurable: true, enumerable: true, ...descriptor });
-                return true;
-            } catch { return false; }
+            const result = UBOOverride.overrideDocumentProp(prop, descriptor);
+            if (result === 'overridden') return true;
+            if (result === 'impossible')
+                console.log(`%c⛔ [SLM] "${prop}": non-configurable (JS spec limit)`, 'color:#ff4444');
+            else
+                console.log(`%c⚠️ [SLM] "${prop}": could not override Proxy`, 'color:#ffaa00');
+            return false;
         };
 
-        const warn = prop =>
-            console.log(`%c⛔ [SLM] uBO controls "${prop}" — cannot modify`, 'color:#ff6600');
-
-        // ── Detección de uBlock Origin ────────────────────────────────────────
         const UBO = {
-            _SIGS: ['setConstant','trapProp','thisScript','normalValue','cloakFunc','logPrefix'],
-
-            _hasSignature(getter) {
-                if (!getter) return false;
-                const s = getter.toString();
-                return this._SIGS.some(sig => s.includes(sig));
-            },
-
-            detectActiveElement() {
-                if (Array.isArray(window.uBO_scriptletsInjected) &&
-                    window.uBO_scriptletsInjected.some(s =>
-                        s.includes('activeElement') || s.includes('trusted-set') || s.includes('"tagName"')))
-                    return true;
-
-                const desc = Object.getOwnPropertyDescriptor(document, 'activeElement');
-                if (desc?.get && this._hasSignature(desc.get)) return true;
-
-                try {
-                    const el = document.activeElement;
-                    if (el?.tagName && !('ownerDocument' in el && 'nodeType' in el && 'getAttribute' in el))
-                        return true;
-                } catch {}
-                return false;
-            },
-
             detect() {
-                blocked.activeElement = this.detectActiveElement();
-
-                const focusDesc = Object.getOwnPropertyDescriptor(document, 'hasFocus');
-                blocked.focus = focusDesc?.get
-                    ? this._hasSignature(focusDesc.get)
-                    : document.hasFocus !== ORIG.hasFocus;
-
-                for (const key of ['hidden', 'visibilityState']) {
-                    const desc = Object.getOwnPropertyDescriptor(document, key);
-                    blocked[key] = !!(desc?.get && this._hasSignature(desc.get));
+                for (const [prop, origGetter] of [
+                    ['hidden',          ORIG.hidden],
+                    ['visibilityState', ORIG.visibilityState]
+                ]) {
+                    if (!origGetter) continue;
+                    const r = UBOOverride.overrideDocumentProp(prop, { get: origGetter });
+                    status[prop] = r === 'overridden' ? false : r;
                 }
 
-                if (Array.isArray(window.uBO_scriptletsInjected)) {
-                    for (const s of window.uBO_scriptletsInjected) {
-                        if (s.includes('hasFocus'))                                          blocked.focus           = true;
-                        if (s.includes('visibilitychange') || s.includes('visibilityState')) blocked.visibilityState = true;
-                        if (s.includes('hidden') && !s.includes('visibility'))               blocked.hidden          = true;
+                const focusResult = UBOOverride.overrideDocumentProp('hasFocus', {
+                    value: ORIG.hasFocus, writable: true
+                });
+                status.focus = focusResult === 'overridden' ? false : focusResult;
+                if (focusResult === 'overridden') Document.prototype.hasFocus = ORIG.hasFocus;
+
+                if (Array.isArray(window.uBO_scriptletsInjected) &&
+                    window.uBO_scriptletsInjected.some(s =>
+                        s.includes('activeElement') || s.includes('trusted-set'))) {
+                    if (ORIG.activeElement) {
+                        const r = UBOOverride.overrideDocumentProp('activeElement', ORIG.activeElement);
+                        status.activeElement = r === 'overridden' ? false : r;
                     }
                 }
             }
@@ -574,33 +690,47 @@
             try { document.dispatchEvent(new Event('visibilitychange')); } catch {}
         };
 
-        // ── Setters ───────────────────────────────────────────────────────────
         const Props = {
             setFocus(mode) {
-                if (blocked.focus) return warn('hasFocus'), false;
+                if (status.focus === 'impossible') {
+                    console.log('%c⛔ [SLM] hasFocus: non-configurable', 'color:#ff4444');
+                    return false;
+                }
                 const fn = mode === 'true' ? () => true : mode === 'false' ? () => false : ORIG.hasFocus;
-                defineProp(document, 'hasFocus', { value: fn, writable: true });
-                Document.prototype.hasFocus = fn;
-                return true;
+                const r  = UBOOverride.overrideDocumentProp('hasFocus', { value: fn, writable: true });
+                if (r === 'overridden') Document.prototype.hasFocus = fn;
+                return r === 'overridden';
             },
+
             setHidden(value) {
-                if (blocked.hidden) return warn('hidden'), false;
-                if (value === 'original')
-                    return ORIG.hidden ? defineProp(document, 'hidden', { get: ORIG.hidden }) : false;
-                return defineProp(document, 'hidden', { get: () => value });
+                if (status.hidden === 'impossible') {
+                    console.log('%c⛔ [SLM] hidden: non-configurable', 'color:#ff4444');
+                    return false;
+                }
+                const getter = value === 'original' ? ORIG.hidden : () => value;
+                if (!getter) return false;
+                return UBOOverride.overrideDocumentProp('hidden', { get: getter }) === 'overridden';
             },
+
             setVisibilityState(value) {
-                if (blocked.visibilityState) return warn('visibilityState'), false;
-                if (value === 'original')
-                    return ORIG.visibilityState
-                        ? defineProp(document, 'visibilityState', { get: ORIG.visibilityState })
-                        : false;
-                return defineProp(document, 'visibilityState', { get: () => value });
+                if (status.visibilityState === 'impossible') {
+                    console.log('%c⛔ [SLM] visibilityState: non-configurable', 'color:#ff4444');
+                    return false;
+                }
+                const getter = value === 'original' ? ORIG.visibilityState : () => value;
+                if (!getter) return false;
+                return UBOOverride.overrideDocumentProp('visibilityState', { get: getter }) === 'overridden';
             },
+
             setActiveElement(tagName) {
-                if (blocked.activeElement) return warn('activeElement'), false;
-                if (tagName === 'original')
-                    return ORIG.activeElement ? defineProp(document, 'activeElement', ORIG.activeElement) : false;
+                if (status.activeElement === 'impossible') {
+                    console.log('%c⛔ [SLM] activeElement: non-configurable', 'color:#ff4444');
+                    return false;
+                }
+                if (tagName === 'original') {
+                    if (!ORIG.activeElement) return false;
+                    return UBOOverride.overrideDocumentProp('activeElement', ORIG.activeElement) === 'overridden';
+                }
 
                 const tag  = tagName.toUpperCase();
                 const fake = {
@@ -617,24 +747,24 @@
                     removeAttribute:       () => {},   hasAttribute:       () => false,
                     hasAttributes:         () => false,
                     getBoundingClientRect: () => ({ top:0, left:0, bottom:0, right:0, width:0, height:0 }),
-                    getClientRects: () => [], matches:      () => false, closest:        () => null,
-                    contains:       () => false, querySelector: () => null, querySelectorAll: () => []
+                    getClientRects: () => [], matches: () => false, closest: () => null,
+                    contains: () => false, querySelector: () => null, querySelectorAll: () => []
                 };
-                return defineProp(document, 'activeElement', { get: () => fake });
+                return UBOOverride.overrideDocumentProp('activeElement', { get: () => fake }) === 'overridden';
             }
         };
 
         const _getStatus = () => ({
-            ubo: { ...blocked },
+            overrideStatus:  { ...status },
             values: {
                 focus:           document.hasFocus(),
                 hidden:          document.hidden,
                 visibilityState: document.visibilityState,
                 activeElement:   document.activeElement?.tagName || 'N/A'
-            }
+            },
+            overrideResults: { ...UBOOverride.results }
         });
 
-        // ── API ───────────────────────────────────────────────────────────────
         const api = {
             status()   { const s = _getStatus(); console.log('📊 [SLM] Document status:', s); return s; },
             getStatus: _getStatus,
@@ -670,38 +800,29 @@
 
             visible() {
                 _persistMode = 'visible';
-                if (!blocked.focus)           Props.setFocus('true');
-                if (!blocked.hidden)          Props.setHidden(false);
-                if (!blocked.visibilityState) Props.setVisibilityState('visible');
+                Props.setFocus('true');
+                Props.setHidden(false);
+                Props.setVisibilityState('visible');
                 triggerVis();
             },
 
             invisible() {
                 _persistMode = 'invisible';
-                if (!blocked.focus)           Props.setFocus('false');
-                if (!blocked.hidden)          Props.setHidden(true);
-                if (!blocked.visibilityState) Props.setVisibilityState('hidden');
+                Props.setFocus('false');
+                Props.setHidden(true);
+                Props.setVisibilityState('hidden');
                 triggerVis();
             },
 
             reset() {
                 _persistMode = null;
-                if (!blocked.focus)           Props.setFocus('original');
-                if (!blocked.hidden)          Props.setHidden('original');
-                if (!blocked.visibilityState) Props.setVisibilityState('original');
-                if (!blocked.activeElement)   Props.setActiveElement('original');
+                Props.setFocus('original');
+                Props.setHidden('original');
+                Props.setVisibilityState('original');
+                Props.setActiveElement('original');
                 triggerVis();
             },
 
-            // ─────────────────────────────────────────────────────────────────
-            // persist() — registra 3 listeners UNA sola vez.
-            // • Solo actúan si _persistMode !== null → sin impacto en páginas
-            //   normales donde nadie llama visible()/invisible().
-            // • _applying previene recursión infinita:
-            //   invisible() → triggerVis() → 'visibilitychange' → listener
-            //   → _applying=true → return → sin recursión.
-            // • No usa Object.defineProperty → no choca con uBO.
-            // ─────────────────────────────────────────────────────────────────
             persist() {
                 if (_persistentListeners) return;
                 _persistentListeners = true;
@@ -732,12 +853,13 @@
     })();
 
     // =========================================================================
-    // 8. SAFE HELPERS
+    // 9. SAFE HELPERS
     // =========================================================================
     function safeProp(propKey, setterFn, label) {
         try {
-            if (DocumentSmartController.getStatus().ubo[propKey]) {
-                console.log(`ℹ️ [SLM] uBO blocks ${label}`);
+            const st = DocumentSmartController.getStatus().overrideStatus;
+            if (st[propKey] === 'impossible') {
+                console.log(`ℹ️ [SLM] "${label}" is non-configurable — cannot override`);
                 return false;
             }
             setterFn();
@@ -774,10 +896,10 @@
     window.safeInvisible     = () => { try { DocumentSmartController.invisible(); return true; } catch { return false; } };
     window.safeResetDocument = () => { try { DocumentSmartController.reset();     return true; } catch { return false; } };
     window.safeStatus        = () => DocumentSmartController.status();
-    window.safeDetectUBO     = () => console.log('🔍 uBO:', DocumentSmartController.getStatus().ubo);
+    window.safeDetectUBO     = () => console.log('🔍 Override results:', UBOOverride.results);
 
     // =========================================================================
-    // 9. ROUTER
+    // 10. ROUTER
     // =========================================================================
     const Router = {
         routes: [],
@@ -807,7 +929,7 @@
     };
 
     // =========================================================================
-    // 10. SITE SCRIPTS
+    // 11. SITE SCRIPTS
     // =========================================================================
     const SiteScripts = {
         register() {
@@ -943,10 +1065,10 @@
     };
 
     // =========================================================================
-    // 11. PUBLIC API
+    // 12. PUBLIC API
     // =========================================================================
     window.SLM = {
-        version: '4.6',
+        version: '4.8',
         config:  Config.settings,
         waiters: {
             sleep:      ms     => Waiters.sleep(ms),
@@ -979,9 +1101,9 @@
         captcha: {
             isPresent:    () => Captcha.isPresent(),
             isResolved:   () => Captcha.isResolved(),
-            wait:         (cb, interval, max) => Captcha.waitForResolution(cb, interval, max),
-            waitPromise:  (timeout, interval) => Captcha.waitForResolutionPromise(timeout, interval),
-            openHCaptcha: timeout => Captcha.openHCaptchaWhenVisible(timeout)
+            wait:         (cb, i, max) => Captcha.waitForResolution(cb, i, max),
+            waitPromise:  (t, i)       => Captcha.waitForResolutionPromise(t, i),
+            openHCaptcha: t            => Captcha.openHCaptchaWhenVisible(t)
         },
         document: DocumentSmartController,
         router: {
@@ -990,6 +1112,13 @@
         },
         spa: {
             onLeave: fn => SPAManager.onLeave(fn)
+        },
+        uboOverride: {
+            results:    UBOOverride.results,
+            signatures: UBOOverride.signatures,
+            override:   (prop, descriptor) => UBOOverride.overrideDocumentProp(prop, descriptor),
+            overrideWin:(prop, value)       => UBOOverride.overrideWindowProp(prop, value),
+            clearCache: ()                  => UBOOverride.clearCache()
         },
         safe: {
             focus:          safeSetFocus,
@@ -1013,18 +1142,12 @@
     };
 
     // =========================================================================
-    // 12. INIT
+    // 13. INIT
     // =========================================================================
     (async () => {
         await Config.detectOptimalSettings();
         SiteScripts.register();
-
-        // persist() — listeners globales sin efecto hasta que alguien llame
-        // safeVisible/safeInvisible. No impacta páginas normales.
         DocumentSmartController.persist();
-
-        // SPAManager — intercepta pushState/replaceState/popstate para
-        // re-ejecutar el Router y limpiar estado en cada navegación SPA.
         SPAManager.init();
 
         if (document.readyState === 'loading') {
@@ -1033,13 +1156,17 @@
             setTimeout(() => Router.run(), 50);
         }
 
-        const { ubo }    = DocumentSmartController.getStatus();
-        const uboBlocked = Object.keys(ubo).filter(k => ubo[k]);
+        const st         = DocumentSmartController.getStatus();
+        const impossible = Object.entries(st.overrideStatus).filter(([,v]) => v === 'impossible').map(([k]) => k);
+        const proxied    = Object.entries(st.overrideStatus).filter(([,v]) => v === 'proxied').map(([k]) => k);
+
         console.log(
-            '%c✅ [SLM] v4.6 ready — window.SLM available',
+            '%c✅ [SLM] v4.8 ready — window.SLM available',
             'background:#00aa00;color:white;padding:2px 5px;border-radius:3px'
         );
-        if (uboBlocked.length)
-            console.log(`%c⚠️ uBO blocks ${uboBlocked.length} property(ies): ${uboBlocked.join(', ')}`, 'color:#ffaa00');
+        if (impossible.length)
+            console.log(`%c⛔ Non-configurable (JS spec limit): ${impossible.join(', ')}`, 'color:#ff4444');
+        if (proxied.length)
+            console.log(`%c⚠️ Proxy (could not override): ${proxied.join(', ')}`, 'color:#ffaa00');
     })();
 })();
