@@ -2,8 +2,8 @@
 
 > A professional userscript framework for bypassing shortlinks with full browser document control.
 
-[![Version](https://img.shields.io/badge/version-4.6-blue.svg)](https://github.com/tu-usuario/shortlink-master)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-4.8-blue.svg)](https://github.com/Suurp/ShorLink-Master)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/Suurp/ShorLink-Master/blob/main/LICENSE)
 [![Tampermonkey](https://img.shields.io/badge/Tampermonkey-compatible-orange.svg)](https://www.tampermonkey.net/)
 [![Violentmonkey](https://img.shields.io/badge/Violentmonkey-compatible-purple.svg)](https://violentmonkey.github.io/)
 
@@ -24,6 +24,7 @@
   - [SLM.document](#slmdocument)
   - [SLM.safe](#slmsafe)
   - [SLM.router](#slmrouter)
+  - [SLM.uboOverride](#slmubooverride)
   - [SLM.spa](#slmspa)
 - [Adding a New Site](#adding-a-new-site)
 - [Usage Examples](#usage-examples)
@@ -39,6 +40,7 @@ SLM is a Tampermonkey/Violentmonkey userscript that provides a modular framework
 
 - **Router** — multi-site routing with support for strings, RegExp and path-specific handlers
 - **SPAManager** — detects SPA navigations (pushState, replaceState, popstate) and re-runs the Router automatically, executing registered cleanup functions on path change
+- **UBOOverride** — instead of yielding to uBlock Origin scriptlets, actively attempts to override them using a 4-technique cascade (instance redefine, prototype redefine, delete+redefine, prototype Proxy). Reports the real outcome per property: `overridden`, `impossible` (JS spec limit), or `proxied`
 - **Waiters** — async waiting with timeout, adaptive backoff and text/condition support
 - **Browser** — smart DOM cache that automatically invalidates disconnected nodes, plus `blockPopups` / `restorePopups` for `window.open` control
 - **Document Smart Controller** — manipulate `hasFocus`, `hidden`, `visibilityState` and `activeElement` with automatic uBlock Origin interference detection
@@ -76,12 +78,12 @@ The **debloated** fork by **Amm0ni4** on Codeberg demonstrated the value of clea
 1. Install [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/)
 2. Click the install button:
 
-[![Install](https://img.shields.io/badge/Install-userscript-blue?style=for-the-badge)](https://raw.githubusercontent.com/Suurp/ShorLink-Master/main/SLM.user.js)
+[![Install](https://img.shields.io/badge/Install-userscript-blue?style=for-the-badge)](https://raw.githubusercontent.com/Suurp/ShorLink-Master/main/slm.user.js)
 
 ### Option 2 — Manual installation
 
 1. Open the Tampermonkey dashboard → **Create new script**
-2. Copy the contents of [`SLM.user.js`](SLM.user.js)
+2. Copy the contents of [`slm.user.js`](slm.user.js)
 3. Save with `Ctrl+S`
 
 ---
@@ -115,16 +117,17 @@ These filters are specifically tuned for shortlink sites and complement SLM dire
 ## Architecture
 
 ```
-SLM v4.6
+SLM v4.8
 ├── Config          — Automatic performance detection and interval tuning
 ├── Cache           — Selector/XPath cache with TTL and live node validation
+├── UBOOverride     — Active uBO override engine: 4-technique cascade, result tracking per property
 ├── SPAManager      — SPA navigation detection (pushState/replaceState/popstate) + cleanup registry
 ├── Waiters         — Async waiting (element, visibility, text, hide)
 ├── Browser         — DOM interaction (get, exists, click, getText, redirect, blockPopups)
 ├── StringUtils     — Text utilities (numbers, base64, ROT13, URL extraction)
 ├── Captcha         — Unified hCaptcha/reCAPTCHA/Turnstile detection and waiting
 ├── DocumentSmartController — focus/hidden/visibilityState/activeElement control
-├── SafeHelpers     — Safe wrappers for window.safe* with uBO detection
+├── SafeHelpers     — Safe wrappers for window.safe* with override-aware status
 ├── Router          — Handler registration and execution by domain/RegExp/path
 └── SiteScripts     — Per-site scripts (registered into Router)
 ```
@@ -318,6 +321,7 @@ Router.register('example.com', async () => {
         SLM.browser.restorePopups(); // runs automatically on SPA navigation
     });
 }, { path: '/ptc' });
+```
 
 ---
 
@@ -459,17 +463,23 @@ await SLM.captcha.waitPromise(60);
 
 ### SLM.document
 
-Control over browser document properties. Automatically detects if uBlock Origin is blocking any property and warns without throwing errors.
+Control over browser document properties. In v4.8 this no longer just detects uBO and yields — it actively attempts to override uBO scriptlets using `UBOOverride`. The result per property (`overridden`, `impossible`, `proxied`) is available via `status()`.
 
 #### `SLM.document.status()` / `SLM.document.getStatus()`
 
-`status()` prints to console and returns the state. `getStatus()` returns silently (for internal use).
+`status()` prints to console and returns the full state including override results. `getStatus()` returns silently (for internal use).
 
 ```javascript
 const st = SLM.document.status();
 // {
-//   ubo: { focus: false, hidden: false, visibilityState: false, activeElement: false },
-//   values: { focus: true, hidden: false, visibilityState: "visible", activeElement: "BODY" }
+//   overrideStatus: {
+//     focus: false,           // false = free or successfully overridden
+//     hidden: false,
+//     visibilityState: false,
+//     activeElement: 'impossible'  // JS spec limit — non-configurable
+//   },
+//   values: { focus: true, hidden: false, visibilityState: "visible", activeElement: "BODY" },
+//   overrideResults: { 'doc.hidden': 'overridden', 'doc.hasFocus': 'overridden', ... }
 // }
 ```
 
@@ -524,10 +534,10 @@ SLM.document.active.original();
 
 ### SLM.safe
 
-uBO-aware wrappers for all document controls. If uBlock Origin is blocking the target property, these functions log a warning and return `false` without throwing. All are also available as global functions (`window.safeVisible()`, etc.).
+uBO-aware wrappers for all document controls. In v4.8 these wrappers attempt to **actively override** uBO scriptlets via `UBOOverride`. They only return `false` when a property is truly `non-configurable` (a JS spec limit that no script can bypass). All are also available as global functions (`window.safeVisible()`, etc.).
 
 ```javascript
-SLM.safe.visible();               // = SLM.document.visible() with uBO guard
+SLM.safe.visible();               // invisible mode: tries to override uBO if needed
 SLM.safe.invisible();
 SLM.safe.reset();
 SLM.safe.focus('true');           // 'true' | 'false' | 'original'
@@ -539,8 +549,8 @@ SLM.safe.activeDiv();
 SLM.safe.activeBody();
 SLM.safe.activeInput();
 SLM.safe.activeButton();
-SLM.safe.status();                // prints full document status to console
-SLM.safe.detectUBO();             // shows which properties uBO is currently blocking
+SLM.safe.status();                // prints full status including override results
+SLM.safe.detectUBO();             // prints UBOOverride.results per property
 ```
 
 ---
@@ -577,6 +587,98 @@ SLM.router.register(/shrink(me|earn)\.(io|com)/, async () => {
 // Same domain, different routes
 SLM.router.register('example.com', downloadHandler, { path: '/download' });
 SLM.router.register('example.com', linkHandler,     { path: '/go' });
+```
+
+---
+
+### SLM.uboOverride
+
+The active uBO override engine. Rather than detecting uBO and yielding, SLM v4.8 **attempts to win the property back** using a 4-technique cascade. Each technique is tried in order, stopped as soon as one succeeds. Results are tracked per property and exposed here.
+
+---
+
+**The 4 override techniques:**
+
+| # | Technique | How it works | When it succeeds |
+|---|-----------|-------------|-----------------|
+| T1 | Instance `defineProperty` | `Object.defineProperty(document, prop, ...)` | uBO used `configurable:true` (most common case) |
+| T2 | Prototype `defineProperty` | `Object.defineProperty(Document.prototype, prop, ...)` | uBO defined on instance but left the prototype free |
+| T3 | Delete + redefine | `delete document[prop]` then `defineProperty` | uBO's descriptor is `configurable:true` — delete removes it |
+| T4 | Prototype Proxy | Wraps the entire prototype in a Proxy intercepting the target property | All other techniques failed, but `setPrototypeOf` is allowed |
+
+---
+
+**The 3 possible results per property:**
+
+| Result | Meaning | Console color |
+|--------|---------|--------------|
+| `overridden` | SLM won — property is under SLM control | 🟢 Green |
+| `impossible` | `configurable:false` — a JS spec limit, no script can bypass this | 🔴 Red |
+| `proxied` | A global `window` Proxy is active — cannot be removed | 🟠 Orange |
+
+---
+
+#### `SLM.uboOverride.results`
+
+Object with the override result for each property attempted so far.
+
+```javascript
+SLM.uboOverride.results
+// Example output:
+// {
+//   'doc.hidden':          'overridden',
+//   'doc.visibilityState': 'overridden',
+//   'doc.hasFocus':        'overridden',
+//   'doc.activeElement':   'impossible',
+//   'win.open':            'overridden'
+// }
+```
+
+---
+
+#### `SLM.uboOverride.override(prop, descriptor)`
+
+Manually attempt to override a `document` property using the 4-technique cascade.
+
+```javascript
+// Override document.hidden to always return false
+SLM.uboOverride.override('hidden', { get: () => false });
+// → 'overridden' | 'impossible' | 'proxied'
+
+// Override document.visibilityState
+SLM.uboOverride.override('visibilityState', { get: () => 'visible' });
+```
+
+---
+
+#### `SLM.uboOverride.overrideWin(prop, value)`
+
+Attempt to override a `window` property. Uses direct assignment first, then falls back to the cascade.
+
+```javascript
+SLM.uboOverride.overrideWin('open', myFakeOpen);
+// → 'overridden' | 'impossible' | 'proxied'
+```
+
+---
+
+#### `SLM.uboOverride.clearCache()`
+
+Clears cached results (except `impossible` — those cannot change). Called automatically on SPA navigation.
+
+```javascript
+SLM.uboOverride.clearCache();
+```
+
+---
+
+#### `SLM.uboOverride.signatures`
+
+Returns the known uBO scriptlet signatures used to identify injected getters/setters.
+
+```javascript
+SLM.uboOverride.signatures
+// → ['setConstant', 'trapProp', 'thisScript', 'normalValue', 'cloakFunc', 'logPrefix', 'noopFunc', 'trueFunc', 'falseFunc']
 ```
 
 ---
@@ -792,6 +894,30 @@ await SLM.browser.click(">XPATH> //a[contains(text(), 'Get Link')]");
 ---
 
 ## Changelog
+
+### v4.8
+- **Strategy change: from defensive (UBOGuard) to offensive (UBOOverride)**
+- Replaced `UBOGuard` (detect + skip) with `UBOOverride` (detect + attempt to win)
+- `UBOOverride` uses a 4-technique cascade per property: T1 instance `defineProperty` → T2 prototype `defineProperty` → T3 delete+redefine → T4 prototype Proxy wrapper
+- Each property now has a tracked result: `overridden` / `impossible` / `proxied` instead of a simple boolean
+- `defineProp()` now calls `UBOOverride.overrideDocumentProp()` — every write in the script actively fights uBO instead of yielding
+- `Browser.blockPopups()` uses `UBOOverride.overrideWindowProp('open', ...)` — fights uBO over `window.open` too
+- `DocumentSmartController.visible()` and `invisible()` no longer check `blocked` flags before setting — they attempt the override directly and report the result
+- `status()` now returns `overrideStatus` and `overrideResults` instead of `ubo` boolean flags
+- `safeDetectUBO()` now prints `UBOOverride.results` (real outcomes) instead of detection flags
+- `SLM.uboOverride` exposed in public API with `results`, `override`, `overrideWin`, `clearCache`, `signatures`
+- `UBOOverride` cache cleared on SPA navigation (except `impossible` entries — those are permanent)
+- Init log now distinguishes `non-configurable` (red ⛔) from `proxied` (orange ⚠️) instead of a generic "uBO blocks" message
+- Version bumped to 4.8
+
+### v4.7
+- Added `UBOGuard` — global proactive uBO detection module with 4-method coverage (signature scan, descriptor flags, write-revert test, `uBO_scriptletsInjected` array)
+- `defineProp()` now routes through `UBOGuard.isBlocked()` before every `Object.defineProperty` — protected properties are silently skipped, no errors thrown
+- `Browser.blockPopups()` now checks `UBOGuard.isWindowPropBlocked('open')` before overwriting `window.open`
+- `DocumentSmartController` UBO detection refactored to use `UBOGuard` as primary source, removing internal duplication
+- `UBOGuard` cache cleared automatically on SPA navigation
+- `SLM.uboGuard` exposed in public API with `isDocumentPropBlocked`, `isWindowPropBlocked`, `isBlocked`, `clearCache`, `signatures`
+- Version bumped to 4.7
 
 ### v4.6
 - Added `SPAManager` — detects SPA navigations via `pushState`, `replaceState`, `popstate` and `MutationObserver`, re-runs Router on path change with debounce
