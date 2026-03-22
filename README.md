@@ -78,12 +78,12 @@ The **debloated** fork by **Amm0ni4** on Codeberg demonstrated the value of clea
 1. Install [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/)
 2. Click the install button:
 
-[![Install](https://img.shields.io/badge/Install-userscript-blue?style=for-the-badge)](https://raw.githubusercontent.com/Suurp/ShorLink-Master/main/slm.user.js)
+[![Install](https://img.shields.io/badge/Install-userscript-blue?style=for-the-badge)](https://raw.githubusercontent.com/Suurp/ShorLink-Master/main/SLM.user.js)
 
 ### Option 2 — Manual installation
 
 1. Open the Tampermonkey dashboard → **Create new script**
-2. Copy the contents of [`slm.user.js`](slm.user.js)
+2. Copy the contents of [`slm.user.js`](SLM.user.js)
 3. Save with `Ctrl+S`
 
 ---
